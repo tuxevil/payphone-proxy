@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "payphone_proxy",
+  "project_id": "4477bb75-1bfa-4b92-b72a-4fab4639b702"
+}
