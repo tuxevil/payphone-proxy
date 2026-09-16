@@ -224,11 +224,10 @@ de Beads; no uses este README como lista de tareas.
 
 ## Licencia
 
-La licencia open source todavía está pendiente de una decisión explícita del
-propietario del proyecto. Mientras no exista un archivo `LICENSE` elegido y
-publicado, este repositorio no concede por sí mismo una licencia de
-redistribución. Consulta [`CONTRIBUTING.md`](CONTRIBUTING.md) para las reglas de
-colaboración vigentes.
+Este proyecto se distribuye bajo la [licencia MIT](LICENSE). Consulta el
+archivo [`LICENSE`](LICENSE) para conocer el texto completo, los permisos y las
+condiciones de uso. Para contribuir, consulta también
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Referencias oficiales
 
