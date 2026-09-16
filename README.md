@@ -9,6 +9,11 @@ autentica ante el proxy con una clave propia. La asignación de tiendas se hace
 mediante alias de configuración, sin entregar credenciales de PayPhone a los
 proyectos ni al navegador.
 
+## Apoya el proyecto
+
+Si este proyecto te resulta útil, puedes apoyar su mantenimiento mediante
+[este enlace de pago](https://ppls.me/UbNkoknv8Ij9nGfgRDOg).
+
 El servicio está pensado para separar ambientes: por ejemplo, un despliegue de
 producción y otro de desarrollo, cada uno con su aplicación, token, base de
 datos y dominio registrados en PayPhone. El mismo `StoreID` solo debe reutilizarse
