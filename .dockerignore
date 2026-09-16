@@ -5,3 +5,4 @@
 /data
 *.db
 coverage.out
+docs/security-audit-*

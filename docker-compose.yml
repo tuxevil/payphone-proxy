@@ -1,0 +1,34 @@
+services:
+  payphone-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      HTTP_ADDR: "${HTTP_ADDR:-:8080}"
+      DATABASE_PATH: "${DATABASE_PATH:-/data/payments.db}"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}"
+      PAYPHONE_RETURN_PATH: "${PAYPHONE_RETURN_PATH:-/payphone/return}"
+      PAYPHONE_RESPONSE_URL: "${PAYPHONE_RESPONSE_URL:-}"
+      PAYPHONE_BASE_URL: "${PAYPHONE_BASE_URL:-https://pay.payphonetodoesposible.com/api}"
+      PAYPHONE_TOKEN: "${PAYPHONE_TOKEN:?PAYPHONE_TOKEN is required}"
+      PAYPHONE_STORES_JSON: "${PAYPHONE_STORES_JSON:?PAYPHONE_STORES_JSON is required}"
+      PAYMENT_PROJECTS_JSON: "${PAYMENT_PROJECTS_JSON:?PAYMENT_PROJECTS_JSON is required}"
+    expose:
+      - "8080"
+    volumes:
+      - payphone-proxy-data:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "/app/payphone-proxy-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  payphone-proxy-data:

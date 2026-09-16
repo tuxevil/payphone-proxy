@@ -111,7 +111,8 @@ docker run --rm --name payphone-proxy \
 El ejemplo limita el puerto al loopback; en producción termina TLS en un
 reverse proxy y conecta el contenedor a una red privada. En Docker usa
 `DATABASE_PATH=/data/payments.db`. El contenedor se ejecuta como usuario sin
-privilegios.
+privilegios. La guía específica para desplegar en producción mediante Coolify
+está en [`COOLIFY.md`](COOLIFY.md).
 
 ## Configuración
 

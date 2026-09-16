@@ -13,9 +13,9 @@ PayPhone.
 4. No copies secretos, bases SQLite ni identificadores operativos al árbol de
    trabajo.
 
-El repositorio todavía no tiene una licencia legal seleccionada por su
-propietario. Hasta que se publique un archivo `LICENSE`, consulta al
-mantenedor antes de redistribuir una copia o incorporar el código a un producto.
+El proyecto se distribuye bajo la [licencia MIT](LICENSE). Consulta el archivo
+`LICENSE` para conocer los permisos y condiciones antes de redistribuir una
+copia o incorporar el código a un producto.
 
 ## Flujo de trabajo
 
