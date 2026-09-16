@@ -4,3 +4,16 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Local configuration and runtime data
+.env
+.env.*
+!.env.example
+/data/
+
+# Build and editor artifacts
+/bin/
+/payphone-proxy
+*.test
+coverage.out
+.DS_Store

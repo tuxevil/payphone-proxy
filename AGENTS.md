@@ -125,3 +125,37 @@ bd prime                # Refresh Beads context
 
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
+
+## Build & Test
+
+The service uses Go 1.24+, the standard `net/http` package and SQLite for the
+default runtime repository. Keep provider calls behind `internal/payphone` so
+HTTP tests can use a fake client.
+
+```bash
+gofmt -w ./cmd ./internal
+go test ./...
+go vet ./...
+go build ./cmd/payphone-proxy
+```
+
+## Architecture Overview
+
+`cmd/payphone-proxy` wires environment configuration, the SQLite repository,
+the PayPhone REST client and the HTTP API. `internal/payments` owns payment
+state, idempotency, project/store assignment and confirmation validation.
+`internal/httpapi` exposes the project API, the central checkout page and the
+PayPhone return endpoint. `internal/config` parses JSON project/store maps;
+secrets stay in the process environment.
+
+## Conventions & Patterns
+
+- Use Go's standard library for HTTP and explicit error handling.
+- Keep amounts as integer cents and validate currency/identifiers at the API boundary.
+- Use a project API key to select the project; never accept a PayPhone token from a request.
+- Serve PayPhone links from the configured central origin with `Referrer-Policy: origin`.
+- Persist an idempotency reservation before calling PayPhone and treat provider/network failures as observable states.
+- Add behavior tests at HTTP or provider-client seams before changing implementation.
+- Track implementation and follow-up work exclusively with `bd`; do not use markdown TODO lists.
+
+<!-- bd-doctor-divergence: ok -->

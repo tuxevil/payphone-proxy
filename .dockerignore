@@ -1,0 +1,6 @@
+.git
+.beads
+.env
+/data
+*.db
+coverage.out
