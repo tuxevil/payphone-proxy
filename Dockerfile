@@ -1,13 +1,13 @@
-FROM golang:1.24 AS build
+FROM golang:1.25.13@sha256:cbff9d1a9041b316010f2da6b701b6c0d597718cb90928c85eb597334a0d23d4 AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/payphone-proxy ./cmd/payphone-proxy
-RUN mkdir -p /runtime-data && chown 65532:65532 /runtime-data
+RUN install -d -m 0750 -o 65532 -g 65532 /runtime-data
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 WORKDIR /app
 COPY --chown=nonroot:nonroot --from=build /out/payphone-proxy /app/payphone-proxy

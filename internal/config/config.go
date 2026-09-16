@@ -10,6 +10,8 @@ import (
 	"github.com/tuxevil/payphone-proxy/internal/payments"
 )
 
+const minimumProjectAPIKeyLength = 32
+
 type Config struct {
 	Addr                string
 	DatabasePath        string
@@ -46,6 +48,9 @@ func Load(lookup func(string) string) (Config, error) {
 	if config.PayPhoneToken == "" {
 		return Config{}, errors.New("PAYPHONE_TOKEN is required")
 	}
+	if isPlaceholderSecret(config.PayPhoneToken) {
+		return Config{}, errors.New("PAYPHONE_TOKEN must not use a template placeholder")
+	}
 	if config.PublicBaseURL == "" {
 		return Config{}, errors.New("PUBLIC_BASE_URL is required")
 	}
@@ -55,8 +60,8 @@ func Load(lookup func(string) string) (Config, error) {
 	if err := validateBaseURL(config.PayPhoneBaseURL, "PAYPHONE_BASE_URL"); err != nil {
 		return Config{}, err
 	}
-	if !strings.HasPrefix(config.PayPhoneReturnPath, "/") || strings.Contains(config.PayPhoneReturnPath, "?") || strings.Contains(config.PayPhoneReturnPath, "#") {
-		return Config{}, errors.New("PAYPHONE_RETURN_PATH must be a path without query or fragment")
+	if err := validateReturnPath(config.PayPhoneReturnPath, "PAYPHONE_RETURN_PATH"); err != nil {
+		return Config{}, err
 	}
 	if config.PayPhoneResponseURL != "" {
 		if err := validateBaseURL(config.PayPhoneResponseURL, "PAYPHONE_RESPONSE_URL"); err != nil {
@@ -65,6 +70,9 @@ func Load(lookup func(string) string) (Config, error) {
 		responseURL, err := url.Parse(config.PayPhoneResponseURL)
 		if err != nil || responseURL.Path == "" || responseURL.Path == "/" {
 			return Config{}, errors.New("PAYPHONE_RESPONSE_URL must include a callback path")
+		}
+		if err := validateReturnPath(responseURL.Path, "PAYPHONE_RESPONSE_URL path"); err != nil {
+			return Config{}, err
 		}
 	}
 
@@ -110,6 +118,9 @@ func parseStores(raw string) (map[string]payments.StoreConfig, error) {
 		if alias == "" || id == "" {
 			return nil, errors.New("store aliases and storeIds must be non-empty")
 		}
+		if _, exists := stores[alias]; exists {
+			return nil, fmt.Errorf("duplicate store alias after trimming %q", alias)
+		}
 		stores[alias] = payments.StoreConfig{Alias: alias, ID: id}
 	}
 
@@ -143,6 +154,15 @@ func parseProjects(raw string, stores map[string]payments.StoreConfig) (map[stri
 		if id == "" || value.APIKey == "" || value.Store == "" {
 			return nil, errors.New("project id, api_key and store must be non-empty")
 		}
+		if len(value.APIKey) < minimumProjectAPIKeyLength {
+			return nil, fmt.Errorf("project %q: api_key must contain at least %d characters", id, minimumProjectAPIKeyLength)
+		}
+		if isPlaceholderSecret(value.APIKey) {
+			return nil, fmt.Errorf("project %q: api_key must not use a template placeholder", id)
+		}
+		if _, exists := projects[id]; exists {
+			return nil, fmt.Errorf("duplicate project id after trimming %q", id)
+		}
 		if previousID, ok := seenAPIKeys[value.APIKey]; ok {
 			return nil, fmt.Errorf("duplicate api_key used by projects %q and %q", previousID, id)
 		}
@@ -171,6 +191,29 @@ func validateBaseURL(raw, name string) error {
 	}
 
 	return nil
+}
+
+func validateReturnPath(path, name string) error {
+	if !strings.HasPrefix(path, "/") || strings.Contains(path, "?") || strings.Contains(path, "#") || path == "/" {
+		return fmt.Errorf("%s must be a non-root path without query or fragment", name)
+	}
+	// Keep the callback out of routes with different authentication or output
+	// semantics. A prefix check is necessary because /checkout/* and
+	// /v1/payments/* are public/authenticated route families, not single paths.
+	if path == "/healthz" || path == "/v1/payments" || strings.HasPrefix(path, "/v1/payments/") || strings.HasPrefix(path, "/checkout/") {
+		return fmt.Errorf("%s conflicts with a reserved API route", name)
+	}
+	return nil
+}
+
+func isPlaceholderSecret(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	for _, marker := range []string{"replace-with-", "replace_with_", "change-me", "change_me", "changeme", "<secret>", "<token>", "<key>"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func isLocalHost(host string) bool {

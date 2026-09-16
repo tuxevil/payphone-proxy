@@ -74,7 +74,14 @@ proyectos.
 ## Persistencia y copias
 
 SQLite es apropiado para una primera instancia con un único proceso y volumen
-persistente. No almacenes la base en el filesystem efímero del contenedor.
+persistente. El proceso usa una conexión, espera de bloqueo de cinco segundos y
+actualizaciones condicionales para transiciones concurrentes; esto no convierte
+SQLite en un almacenamiento multi-réplica. No almacenes la base en el
+filesystem efímero del contenedor.
+
+El proceso crea o restringe el archivo a permisos `0600` y el directorio hoja a
+`0750` cuando usa una ruta de archivo local. Mantén esos permisos al copiar o
+restaurar.
 
 Una copia en caliente puede hacerse con la herramienta de SQLite o el mecanismo
 de snapshots del volumen. Ejemplo genérico:

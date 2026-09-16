@@ -1,9 +1,13 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -15,14 +19,22 @@ import (
 type Server struct {
 	service            *payments.Service
 	payPhoneReturnPath string
+	createLimiter      *fixedWindowLimiter
+	returnLimiter      *fixedWindowLimiter
 }
 
 func New(service *payments.Service) http.Handler {
-	server := &Server{service: service, payPhoneReturnPath: service.PayPhoneReturnPath()}
+	server := &Server{
+		service:            service,
+		payPhoneReturnPath: service.PayPhoneReturnPath(),
+		createLimiter:      newFixedWindowLimiter(createRequestsPerWindow, rateLimitWindow),
+		returnLimiter:      newFixedWindowLimiter(returnAttemptsPerWindow, rateLimitWindow),
+	}
 	return server
 }
 
 func (s *Server) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	setSecurityHeaders(response)
 	switch {
 	case request.Method == http.MethodPost && request.URL.Path == "/v1/payments":
 		s.createPayment(response, request)
@@ -64,18 +76,39 @@ func (s *Server) createPayment(response http.ResponseWriter, request *http.Reque
 		writeError(response, http.StatusUnauthorized, "unauthorized", "invalid project credentials")
 		return
 	}
+	if !s.createLimiter.allow(project.ID) {
+		writeRateLimit(response)
+		return
+	}
 	idempotencyKey := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
 	if idempotencyKey == "" {
 		writeError(response, http.StatusBadRequest, "invalid_request", "Idempotency-Key is required")
 		return
 	}
 
+	mediaType, _, mediaTypeErr := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if mediaTypeErr != nil || !strings.EqualFold(mediaType, "application/json") {
+		writeError(response, http.StatusUnsupportedMediaType, "invalid_request", "Content-Type must be application/json")
+		return
+	}
+
 	requestBody := http.MaxBytesReader(response, request.Body, 64*1024)
 	decoder := json.NewDecoder(requestBody)
-	decoder.DisallowUnknownFields()
 	var input createPaymentRequest
-	if err := decoder.Decode(&input); err != nil {
+	var rawJSON json.RawMessage
+	if err := decoder.Decode(&rawJSON); err != nil || rejectDuplicateJSONKeys(rawJSON) != nil {
 		writeError(response, http.StatusBadRequest, "invalid_request", "request body must be valid JSON")
+		return
+	}
+	strictDecoder := json.NewDecoder(bytes.NewReader(rawJSON))
+	strictDecoder.DisallowUnknownFields()
+	if err := strictDecoder.Decode(&input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid_request", "request body must be valid JSON")
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		writeError(response, http.StatusBadRequest, "invalid_request", "request body must contain exactly one JSON object")
 		return
 	}
 
@@ -150,6 +183,10 @@ func (s *Server) checkout(response http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) payPhoneReturn(response http.ResponseWriter, request *http.Request) {
+	if len(request.URL.RawQuery) > 4096 {
+		writeError(response, http.StatusBadRequest, "invalid_return", "return query is too large")
+		return
+	}
 	providerID, err := strconv.ParseInt(strings.TrimSpace(request.URL.Query().Get("id")), 10, 64)
 	if err != nil || providerID <= 0 {
 		writeError(response, http.StatusBadRequest, "invalid_return", "PayPhone id is required")
@@ -158,6 +195,14 @@ func (s *Server) payPhoneReturn(response http.ResponseWriter, request *http.Requ
 	clientTransactionID := callbackClientTransactionID(request.URL.Query())
 	if clientTransactionID == "" {
 		writeError(response, http.StatusBadRequest, "invalid_return", "clientTransactionId is required")
+		return
+	}
+	if len(clientTransactionID) > 128 {
+		writeError(response, http.StatusBadRequest, "invalid_return", "clientTransactionId is too long")
+		return
+	}
+	if !s.returnLimiter.allow(clientTransactionID) {
+		writeRateLimit(response)
 		return
 	}
 
@@ -258,6 +303,79 @@ func writeError(response http.ResponseWriter, status int, code, message string) 
 			"message": message,
 		},
 	})
+}
+
+func setSecurityHeaders(response http.ResponseWriter) {
+	response.Header().Set("Cache-Control", "no-store")
+	response.Header().Set("Pragma", "no-cache")
+	response.Header().Set("X-Content-Type-Options", "nosniff")
+	response.Header().Set("X-Frame-Options", "DENY")
+	response.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+	response.Header().Set("Referrer-Policy", "no-referrer")
+}
+
+func writeRateLimit(response http.ResponseWriter) {
+	response.Header().Set("Retry-After", "60")
+	writeError(response, http.StatusTooManyRequests, "rate_limited", "too many requests")
+}
+
+func rejectDuplicateJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	var walk func() error
+	walk = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, isDelimiter := token.(json.Delim)
+		if !isDelimiter {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := make(map[string]struct{})
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("JSON object key is not a string")
+				}
+				normalizedKey := strings.ToLower(key)
+				if _, exists := seen[normalizedKey]; exists {
+					return fmt.Errorf("duplicate JSON object key %q", key)
+				}
+				seen[normalizedKey] = struct{}{}
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		case '[':
+			for decoder.More() {
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		default:
+			return errors.New("unexpected JSON delimiter")
+		}
+	}
+	if err := walk(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }
 
 var checkoutRedirectTemplate = template.Must(template.New("checkout-redirect").Parse(`<!doctype html>

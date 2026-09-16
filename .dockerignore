@@ -1,6 +1,7 @@
 .git
 .beads
 .env
+.env.*
 /data
 *.db
 coverage.out

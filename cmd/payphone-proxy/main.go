@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,7 +23,9 @@ import (
 func main() {
 	settings, err := config.Load(os.Getenv)
 	if err != nil {
-		log.Fatal(err)
+		// Keep configuration details out of startup logs because they may contain
+		// sensitive values.
+		log.Fatal("invalid configuration")
 	}
 	if err := ensureDatabaseDirectory(settings.DatabasePath); err != nil {
 		log.Fatal(err)
@@ -46,6 +50,7 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 * 1024,
 	}
 
 	shutdownContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -66,8 +71,30 @@ func main() {
 }
 
 func ensureDatabaseDirectory(databasePath string) error {
-	if databasePath == ":memory:" || databasePath == "" || filepath.Dir(databasePath) == "." {
+	if databasePath == ":memory:" || databasePath == "" || strings.HasPrefix(databasePath, "file:") {
 		return nil
 	}
-	return os.MkdirAll(filepath.Dir(databasePath), 0750)
+	databaseDirectory := filepath.Dir(databasePath)
+	if err := os.MkdirAll(databaseDirectory, 0750); err != nil {
+		return err
+	}
+	// Tighten the leaf directory when it is managed by this process. Avoid
+	// chmod-ing the current directory for a bare relative database filename.
+	if databaseDirectory != "." && databaseDirectory != string(filepath.Separator) {
+		if err := os.Chmod(databaseDirectory, 0750); err != nil {
+			return fmt.Errorf("restrict database directory: %w", err)
+		}
+	}
+	database, err := os.OpenFile(databasePath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return fmt.Errorf("create database file: %w", err)
+	}
+	if err := database.Chmod(0600); err != nil {
+		_ = database.Close()
+		return fmt.Errorf("restrict database file: %w", err)
+	}
+	if err := database.Close(); err != nil {
+		return fmt.Errorf("close database file: %w", err)
+	}
+	return nil
 }

@@ -69,6 +69,10 @@ type Payment struct {
 type Repository interface {
 	Reserve(context.Context, Payment) (Payment, bool, error)
 	Update(context.Context, Payment) error
+	// UpdateIfStatus applies a state transition only when the row still has
+	// expectedStatus. The compare-and-swap is required because provider calls
+	// happen outside the database transaction.
+	UpdateIfStatus(context.Context, Payment, Status) (bool, error)
 	ByID(context.Context, string) (Payment, error)
 	ByPublicToken(context.Context, string) (Payment, error)
 	ByClientTransactionID(context.Context, string) (Payment, error)
@@ -125,6 +129,20 @@ func (r *MemoryRepository) Update(_ context.Context, payment Payment) error {
 	}
 	r.payments[payment.ID] = clonePayment(payment)
 	return nil
+}
+
+func (r *MemoryRepository) UpdateIfStatus(_ context.Context, payment Payment, expectedStatus Status) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, ok := r.payments[payment.ID]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if current.Status != expectedStatus {
+		return false, nil
+	}
+	r.payments[payment.ID] = clonePayment(payment)
+	return true, nil
 }
 
 func (r *MemoryRepository) ByID(_ context.Context, id string) (Payment, error) {

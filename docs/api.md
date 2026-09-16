@@ -94,8 +94,8 @@ navegador son solo una ayuda para la interfaz.
 | `pending` | PayPhone devolvió una sesión y el comprador puede pagar. |
 | `paid` | `Confirm` validó una respuesta aprobada. |
 | `cancelled` | `Confirm` devolvió el código de cancelación documentado. |
-| `failed` | Fallo definitivo de preparación, confirmación o respuesta no aprobada. |
-| `unknown` | Error de red u otro resultado que no permite afirmar el estado. |
+| `failed` | Rechazo definitivo del proveedor o respuesta de preparación inválida. No se reintenta automáticamente. |
+| `unknown` | Error de red, timeout, límite del proveedor o estado no reconocido que no permite afirmar el resultado. Puede volver a confirmarse con el mismo identificador. |
 
 La versión actual no reconcilia automáticamente estados `unknown` ni
 retornos perdidos.
@@ -110,6 +110,8 @@ GET /checkout/<public-token>
 - Solo funciona mientras el pago está `pending`.
 - Devuelve `200 OK`, `Content-Type: text/html` y
   `Referrer-Policy: origin`.
+- Incluye `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY` y una CSP sin recursos externos.
 - Navega automáticamente al enlace de tarjeta que PayPhone devolvió para esa
   sesión (ruta `Anonymous`).
 - No muestra una opción separada de PayPhone wallet ni expone el token secreto
@@ -138,14 +140,21 @@ El proxy también acepta las variantes de capitalización
 
 - `400 invalid_return` si falta `id` o el identificador de cliente;
 - `422 confirmation_mismatch` si la respuesta confirmada no coincide en
-  transacción, importe o moneda;
+  transacción, importe, moneda o tienda;
 - `502 provider_error` si PayPhone no responde correctamente;
+- `429 rate_limited` si se supera el límite temporal del retorno;
 - `404 not_found` si no existe la reserva local.
 
 Para un pago pendiente, el proxy llama a
 `POST /button/V2/Confirm` con el token del despliegue, valida la respuesta,
 guarda el nuevo estado y evita aceptar un identificador de proveedor distinto
-en una repetición.
+en una repetición. Las transiciones se aplican con una comprobación atómica del
+estado; un retorno concurrente no puede degradar un pago `paid`.
+
+El proxy permite hasta 60 creaciones por proyecto y minuto y hasta 6 intentos
+de retorno por `clientTransactionId` y minuto. Los límites son locales a cada
+proceso y complementan los límites del reverse proxy; en varias réplicas se
+necesita un limitador compartido.
 
 ### Destino del proyecto
 
@@ -188,7 +197,8 @@ Códigos habituales:
 
 | HTTP | `code` | Causa |
 | --- | --- | --- |
-| 400 | `invalid_request` | JSON inválido, campo desconocido, importe/moneda inválidos o falta de idempotencia. |
+| 400 | `invalid_request` | JSON inválido, claves JSON duplicadas, más de un documento JSON, campo desconocido, importe/moneda inválidos o falta de idempotencia. |
+| 415 | `invalid_request` | `Content-Type` no es `application/json`. |
 | 400 | `invalid_return` | Faltan parámetros del retorno. |
 | 401 | `unauthorized` | Bearer ausente o incorrecto. |
 | 404 | `not_found` | Pago, checkout o ruta inexistente. |
@@ -196,6 +206,7 @@ Códigos habituales:
 | 409 | `checkout_unavailable` | El pago ya no está pendiente. |
 | 422 | `confirmation_mismatch` | Confirmación de PayPhone no coincide con la reserva. |
 | 502 | `provider_error` | PayPhone rechazó o no pudo procesar la llamada. |
+| 429 | `rate_limited` | Se superó el límite de creación o de retorno. |
 | 500 | `internal_error` | Error interno no esperado. |
 
 Los mensajes se mantienen deliberadamente genéricos: no incluyen el Bearer,

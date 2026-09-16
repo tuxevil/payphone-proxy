@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tuxevil/payphone-proxy/internal/payphone"
@@ -28,20 +29,68 @@ type CreateInput struct {
 }
 
 type Service struct {
-	config   Config
-	repo     Repository
-	provider payphone.Client
-	now      func() time.Time
-	newToken func(int) (string, error)
+	config        Config
+	repo          Repository
+	provider      payphone.Client
+	now           func() time.Time
+	newToken      func(int) (string, error)
+	confirmLocks  *paymentLocks
+	providerSlots chan struct{}
+}
+
+const (
+	persistenceTimeout       = 5 * time.Second
+	providerConcurrencyLimit = 32
+)
+
+// paymentLocks deduplicates confirmation work within one process without
+// retaining an unbounded mutex per payment. SQLite's conditional update below
+// remains necessary for another process sharing the database.
+type paymentLocks struct {
+	mu      sync.Mutex
+	entries map[string]*paymentLockEntry
+}
+
+type paymentLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newPaymentLocks() *paymentLocks {
+	return &paymentLocks{entries: make(map[string]*paymentLockEntry)}
+}
+
+func (l *paymentLocks) lock(key string) func() {
+	l.mu.Lock()
+	entry := l.entries[key]
+	if entry == nil {
+		entry = &paymentLockEntry{}
+		l.entries[key] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		l.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(l.entries, key)
+		}
+		l.mu.Unlock()
+	}
 }
 
 func NewService(config Config, repo Repository, provider payphone.Client) *Service {
 	return &Service{
-		config:   config,
-		repo:     repo,
-		provider: provider,
-		now:      time.Now,
-		newToken: randomToken,
+		config:        config,
+		repo:          repo,
+		provider:      provider,
+		now:           time.Now,
+		newToken:      randomToken,
+		confirmLocks:  newPaymentLocks(),
+		providerSlots: make(chan struct{}, providerConcurrencyLimit),
 	}
 }
 
@@ -114,7 +163,7 @@ func (s *Service) Create(ctx context.Context, project Project, idempotencyKey st
 		return reserved, false, nil
 	}
 
-	prepared, err := s.provider.Prepare(ctx, payphone.PrepareRequest{
+	prepared, err := s.prepare(ctx, payphone.PrepareRequest{
 		Amount:              input.Amount,
 		AmountWithoutTax:    input.Amount,
 		ClientTransactionID: payment.ClientTransactionID,
@@ -128,13 +177,17 @@ func (s *Service) Create(ctx context.Context, project Project, idempotencyKey st
 	if err != nil {
 		payment.Status = statusForProviderError(err)
 		payment.UpdatedAt = s.now().UTC()
-		_ = s.repo.Update(ctx, payment)
+		if persistErr := s.updateIfStatus(payment, StatusPreparing); persistErr != nil {
+			return Payment{}, false, fmt.Errorf("%w: persist provider state: %v", ErrProvider, persistErr)
+		}
 		return Payment{}, false, fmt.Errorf("%w: %v", ErrProvider, err)
 	}
 	if err := validatePreparedResponse(prepared); err != nil {
 		payment.Status = StatusFailed
 		payment.UpdatedAt = s.now().UTC()
-		_ = s.repo.Update(ctx, payment)
+		if persistErr := s.updateIfStatus(payment, StatusPreparing); persistErr != nil {
+			return Payment{}, false, fmt.Errorf("%w: persist invalid provider response: %v", ErrProvider, persistErr)
+		}
 		return Payment{}, false, err
 	}
 
@@ -143,7 +196,7 @@ func (s *Service) Create(ctx context.Context, project Project, idempotencyKey st
 	payment.PayWithPayPhone = prepared.PayWithPayPhone
 	payment.Status = StatusPending
 	payment.UpdatedAt = s.now().UTC()
-	if err := s.repo.Update(ctx, payment); err != nil {
+	if err := s.updateIfStatusRequired(payment, StatusPreparing); err != nil {
 		return Payment{}, false, err
 	}
 
@@ -170,6 +223,10 @@ func (s *Service) HandleReturn(ctx context.Context, providerID int64, clientTran
 	if providerID <= 0 || strings.TrimSpace(clientTransactionID) == "" {
 		return Payment{}, ErrInvalidInput
 	}
+	if s.confirmLocks != nil {
+		unlock := s.confirmLocks.lock(clientTransactionID)
+		defer unlock()
+	}
 
 	payment, err := s.repo.ByClientTransactionID(ctx, clientTransactionID)
 	if err != nil {
@@ -182,17 +239,24 @@ func (s *Service) HandleReturn(ctx context.Context, providerID int64, clientTran
 		return payment, nil
 	}
 
-	confirmed, err := s.provider.Confirm(ctx, payphone.ConfirmRequest{
+	confirmed, err := s.confirm(ctx, payphone.ConfirmRequest{
 		ID:                  providerID,
 		ClientTransactionID: clientTransactionID,
 	})
 	if err != nil {
+		expectedStatus := payment.Status
+		payment.Status = statusForProviderError(err)
+		payment.UpdatedAt = s.now().UTC()
+		if persistErr := s.updateIfStatus(payment, expectedStatus); persistErr != nil {
+			return Payment{}, fmt.Errorf("%w: persist provider state: %v", ErrProvider, persistErr)
+		}
 		return Payment{}, fmt.Errorf("%w: %v", ErrProvider, err)
 	}
 	if err := validateConfirmation(payment, confirmed, providerID); err != nil {
 		return Payment{}, err
 	}
 
+	expectedStatus := payment.Status
 	payment.ProviderTransactionID = confirmed.TransactionID
 	if payment.ProviderTransactionID == 0 {
 		payment.ProviderTransactionID = providerID
@@ -203,14 +267,111 @@ func (s *Service) HandleReturn(ctx context.Context, providerID int64, clientTran
 	case 2:
 		payment.Status = StatusCancelled
 	default:
-		payment.Status = StatusFailed
+		payment.Status = StatusUnknown
 	}
 	payment.UpdatedAt = s.now().UTC()
-	if err := s.repo.Update(ctx, payment); err != nil {
+	settled, err := s.transitionPayment(payment, expectedStatus)
+	if err != nil {
 		return Payment{}, err
 	}
 
-	return payment, nil
+	return settled, nil
+}
+
+func (s *Service) prepare(ctx context.Context, request payphone.PrepareRequest) (payphone.PrepareResponse, error) {
+	if err := s.acquireProvider(ctx); err != nil {
+		return payphone.PrepareResponse{}, err
+	}
+	defer s.releaseProvider()
+	return s.provider.Prepare(ctx, request)
+}
+
+func (s *Service) confirm(ctx context.Context, request payphone.ConfirmRequest) (payphone.ConfirmResponse, error) {
+	if err := s.acquireProvider(ctx); err != nil {
+		return payphone.ConfirmResponse{}, err
+	}
+	defer s.releaseProvider()
+	return s.provider.Confirm(ctx, request)
+}
+
+func (s *Service) acquireProvider(ctx context.Context) error {
+	if s.providerSlots == nil {
+		return nil
+	}
+	select {
+	case s.providerSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Service) releaseProvider() {
+	if s.providerSlots != nil {
+		<-s.providerSlots
+	}
+}
+
+func (s *Service) persistContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), persistenceTimeout)
+}
+
+func (s *Service) updateIfStatus(payment Payment, expectedStatus Status) error {
+	ctx, cancel := s.persistContext()
+	defer cancel()
+	_, err := s.repo.UpdateIfStatus(ctx, payment, expectedStatus)
+	return err
+}
+
+func (s *Service) updateIfStatusRequired(payment Payment, expectedStatus Status) error {
+	ctx, cancel := s.persistContext()
+	defer cancel()
+	updated, err := s.repo.UpdateIfStatus(ctx, payment, expectedStatus)
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return fmt.Errorf("payment state changed before preparation completed")
+	}
+	return nil
+}
+
+func (s *Service) transitionPayment(payment Payment, expectedStatus Status) (Payment, error) {
+	ctx, cancel := s.persistContext()
+	defer cancel()
+	updated, err := s.repo.UpdateIfStatus(ctx, payment, expectedStatus)
+	if err != nil {
+		return Payment{}, err
+	}
+	if updated {
+		return payment, nil
+	}
+
+	current, err := s.repo.ByClientTransactionID(ctx, payment.ClientTransactionID)
+	if err != nil {
+		return Payment{}, err
+	}
+	// An approval is stronger evidence than a competing uncertain/cancelled
+	// result for the same provider transaction. It may upgrade an uncertain
+	// state with no prior transaction ID, or a state tied to the same ID, but no
+	// later cancellation can downgrade paid because paid is terminal.
+	canUpgradeUnknown := current.Status == StatusUnknown && (current.ProviderTransactionID == 0 || current.ProviderTransactionID == payment.ProviderTransactionID)
+	canUpgradeCancelled := current.Status == StatusCancelled && current.ProviderTransactionID == payment.ProviderTransactionID
+	if payment.Status == StatusPaid && (canUpgradeUnknown || canUpgradeCancelled) {
+		updated, err = s.repo.UpdateIfStatus(ctx, payment, current.Status)
+		if err != nil {
+			return Payment{}, err
+		}
+		if updated {
+			return payment, nil
+		}
+		current, err = s.repo.ByClientTransactionID(ctx, payment.ClientTransactionID)
+		if err != nil {
+			return Payment{}, err
+		}
+	}
+
+	return current, nil
 }
 
 func (s *Service) payPhoneReturnURL() string {
@@ -294,7 +455,10 @@ func validateConfirmation(payment Payment, confirmed payphone.ConfirmResponse, p
 	if confirmed.ClientTransactionID != payment.ClientTransactionID {
 		return ErrInvalidConfirmation
 	}
-	if confirmed.Amount != payment.Amount || strings.ToUpper(confirmed.Currency) != payment.Currency {
+	if confirmed.Amount != payment.Amount || strings.ToUpper(strings.TrimSpace(confirmed.Currency)) != payment.Currency {
+		return ErrInvalidConfirmation
+	}
+	if confirmed.StoreID != "" && confirmed.StoreID != payment.StoreID {
 		return ErrInvalidConfirmation
 	}
 	if confirmed.TransactionID != 0 && confirmed.TransactionID != providerID {
@@ -307,6 +471,9 @@ func validateConfirmation(payment Payment, confirmed payphone.ConfirmResponse, p
 func statusForProviderError(err error) Status {
 	var httpError *payphone.HTTPError
 	if errors.As(err, &httpError) {
+		if httpError.StatusCode >= 500 || httpError.StatusCode == 408 || httpError.StatusCode == 429 {
+			return StatusUnknown
+		}
 		return StatusFailed
 	}
 

@@ -128,7 +128,7 @@ bd prime                # Refresh Beads context
 
 ## Build & Test
 
-The service uses Go 1.24+, the standard `net/http` package and SQLite for the
+The service uses Go 1.25.13+, the standard `net/http` package and SQLite for the
 default runtime repository. Keep provider calls behind `internal/payphone` so
 HTTP tests can use a fake client.
 

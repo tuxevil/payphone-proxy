@@ -19,6 +19,15 @@ func NewSQLiteRepository(database *sql.DB) (*SQLiteRepository, error) {
 		return nil, errors.New("sqlite database is nil")
 	}
 	repository := &SQLiteRepository{database: database}
+	// SQLite allows concurrent readers, but this service uses a single local
+	// database. A single connection plus a busy timeout makes lock acquisition
+	// predictable and leaves the compare-and-swap transition below as the
+	// authority for concurrent state changes.
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+	if _, err := database.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		return nil, fmt.Errorf("configure sqlite busy timeout: %w", err)
+	}
 	if _, err := database.Exec(`
 CREATE TABLE IF NOT EXISTS payments (
     id TEXT PRIMARY KEY,
@@ -94,6 +103,28 @@ WHERE id = ?
 	}
 
 	return nil
+}
+
+func (r *SQLiteRepository) UpdateIfStatus(ctx context.Context, payment Payment, expectedStatus Status) (bool, error) {
+	values := paymentValues(payment)[1:]
+	values = append(values, payment.ID, string(expectedStatus))
+	result, err := r.database.ExecContext(ctx, `
+UPDATE payments SET
+    project_id = ?, order_id = ?, amount = ?, currency = ?, store_alias = ?,
+    store_id = ?, reference = ?, idempotency_key = ?, client_transaction_id = ?,
+    public_token = ?, checkout_url = ?, pay_with_card = ?, pay_with_payphone = ?,
+    provider_payment_id = ?, provider_transaction_id = ?, return_url = ?,
+    status = ?, created_at = ?, updated_at = ?
+WHERE id = ? AND status = ?
+`, values...)
+	if err != nil {
+		return false, fmt.Errorf("conditional payment update: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect conditional payment update: %w", err)
+	}
+	return rows == 1, nil
 }
 
 func (r *SQLiteRepository) ByID(ctx context.Context, id string) (Payment, error) {

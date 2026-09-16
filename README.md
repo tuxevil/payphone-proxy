@@ -64,7 +64,7 @@ permisos y adaptadores verificados por separado.
 
 ## Requisitos
 
-- Go 1.24 o posterior para desarrollo y compilación.
+- Go 1.25.13 o posterior para desarrollo y compilación.
 - SQLite local (el binario usa `modernc.org/sqlite`, sin CGO).
 - Un reverse proxy que termine TLS en producción y reenvíe las rutas del
   servicio.
@@ -97,14 +97,16 @@ Para Docker, monta `/data` como volumen persistente:
 ```bash
 docker build -t payphone-proxy .
 docker run --rm --name payphone-proxy \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   --env-file .env \
   -v payphone-proxy-data:/data \
   payphone-proxy
 ```
 
-En Docker usa `DATABASE_PATH=/data/payments.db`. El contenedor se ejecuta como
-usuario sin privilegios.
+El ejemplo limita el puerto al loopback; en producción termina TLS en un
+reverse proxy y conecta el contenedor a una red privada. En Docker usa
+`DATABASE_PATH=/data/payments.db`. El contenedor se ejecuta como usuario sin
+privilegios.
 
 ## Configuración
 

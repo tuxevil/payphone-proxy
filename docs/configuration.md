@@ -27,10 +27,10 @@ variable obligatoria o el JSON es inválido, el proceso termina sin arrancar.
 | `DATABASE_PATH` | No | `./data/payments.db` | Archivo SQLite. En Docker se recomienda `/data/payments.db` sobre un volumen persistente. |
 | `PUBLIC_BASE_URL` | Sí | — | Origen absoluto desde el que se abre `/checkout/{token}`. Debe coincidir con el dominio WEB registrado en PayPhone. |
 | `PAYPHONE_WEB_DOMAIN` | No | — | Alias legacy de `PUBLIC_BASE_URL`; solo se usa cuando la variable canónica está vacía. |
-| `PAYPHONE_RETURN_PATH` | No | `/payphone/return` | Ruta de callback cuando no se define una URL completa. No admite query ni fragmento. |
-| `PAYPHONE_RESPONSE_URL` | No | — | URL absoluta registrada en PayPhone para el retorno. Debe incluir una ruta distinta de `/`; puede usar otro host que llegue al mismo proxy. |
+| `PAYPHONE_RETURN_PATH` | No | `/payphone/return` | Ruta de callback cuando no se define una URL completa. No admite query, fragmento, raíz ni rutas reservadas del API. |
+| `PAYPHONE_RESPONSE_URL` | No | — | URL absoluta registrada en PayPhone para el retorno. Debe incluir una ruta no reservada distinta de `/`; puede usar otro host que llegue al mismo proxy. |
 | `PAYPHONE_BASE_URL` | No | `https://pay.payphonetodoesposible.com/api` | Base del API oficial. Solo cambia este valor para un endpoint compatible controlado. |
-| `PAYPHONE_TOKEN` | Sí | — | Bearer token secreto de la aplicación PayPhone de este ambiente. |
+| `PAYPHONE_TOKEN` | Sí | — | Bearer token secreto de la aplicación PayPhone de este ambiente; se rechazan placeholders de la plantilla. |
 | `PAYPHONE_STORES_JSON` | Sí | — | Objeto JSON `alias -> StoreID`. Debe contener al menos una tienda. |
 | `PAYMENT_PROJECTS_JSON` | Sí | — | Objeto JSON `project_id -> configuración del proyecto`. Debe contener al menos un proyecto. |
 
@@ -65,8 +65,11 @@ PAYMENT_PROJECTS_JSON='{"proyecto-produccion":{"api_key":"replace-with-project-k
 
 Campos:
 
-- `api_key`: obligatorio, no vacío y único entre todos los proyectos del
-  despliegue. Es la credencial usada en `Authorization: Bearer ...`.
+- `api_key`: obligatorio, único entre todos los proyectos del despliegue y de
+  al menos 32 caracteres. Genera una clave aleatoria de alta entropía; no uses
+  nombres, placeholders ni claves cortas (los placeholders conocidos se
+  rechazan al iniciar). Es la credencial usada en
+  `Authorization: Bearer ...`.
 - `store`: obligatorio; debe coincidir con una clave de
   `PAYPHONE_STORES_JSON`.
 - `return_url`: opcional. Si está vacío, el callback devuelve el estado en

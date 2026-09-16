@@ -76,3 +76,25 @@ func TestHTTPClientReturnsBoundedProviderError(t *testing.T) {
 		t.Fatalf("Prepare error = %q", err.Error())
 	}
 }
+
+func TestHTTPClientDoesNotFollowProviderRedirect(t *testing.T) {
+	redirectTargetCalls := 0
+	target := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		redirectTargetCalls++
+		http.Error(response, "must not be reached", http.StatusInternalServerError)
+	}))
+	defer target.Close()
+	provider := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		http.Redirect(response, request, target.URL, http.StatusFound)
+	}))
+	defer provider.Close()
+
+	client := payphone.NewHTTPClient(provider.URL, "test-token", provider.Client())
+	_, err := client.Prepare(context.Background(), payphone.PrepareRequest{Amount: 100, StoreID: "store", Currency: "USD", ClientTransactionID: "client", ResponseURL: "https://proxy.example.test/return"})
+	if err == nil || !strings.Contains(err.Error(), "302") {
+		t.Fatalf("Prepare error = %v, want HTTP 302", err)
+	}
+	if redirectTargetCalls != 0 {
+		t.Fatalf("redirect target calls = %d, want 0", redirectTargetCalls)
+	}
+}

@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -283,8 +284,8 @@ func TestProviderFailureIsPersistedAndReturnedAsBadGateway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load failed payment: %v", err)
 	}
-	if payment.Status != payments.StatusFailed {
-		t.Fatalf("failed payment status = %q, want failed", payment.Status)
+	if payment.Status != payments.StatusUnknown {
+		t.Fatalf("failed payment status = %q, want unknown", payment.Status)
 	}
 }
 
@@ -299,6 +300,117 @@ func TestHealthEndpointDoesNotRequireProjectCredentials(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"status":"ok"`) {
 		t.Fatalf("health body = %q", response.Body.String())
+	}
+}
+
+func TestCreateRejectsTrailingJSONAndSetsSecurityHeaders(t *testing.T) {
+	service := payments.NewService(payments.Config{
+		PublicBaseURL: "https://proxy.example.test",
+		Projects: map[string]payments.Project{
+			"project-a": {ID: "project-a", APIKey: "project-a-secret", StoreAlias: "store-a"},
+		},
+		Stores: map[string]payments.StoreConfig{
+			"store-a": {Alias: "store-a", ID: "store-id-a"},
+		},
+	}, payments.NewMemoryRepository(), &fakePayPhone{})
+	handler := httpapi.New(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/payments", strings.NewReader(`{"order_id":"order","amount":100,"currency":"USD"}{"amount":101}`))
+	request.Header.Set("Authorization", "Bearer project-a-secret")
+	request.Header.Set("Idempotency-Key", "strict-json")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("trailing JSON status = %d, want 400; body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("X-Content-Type-Options") != "nosniff" || response.Header().Get("X-Frame-Options") != "DENY" || response.Header().Get("Content-Security-Policy") == "" {
+		t.Fatalf("security headers = %#v", response.Header())
+	}
+}
+
+func TestCreateRejectsDuplicateJSONKeys(t *testing.T) {
+	service := payments.NewService(payments.Config{
+		PublicBaseURL: "https://proxy.example.test",
+		Projects: map[string]payments.Project{
+			"project-a": {ID: "project-a", APIKey: "project-a-secret", StoreAlias: "store-a"},
+		},
+		Stores: map[string]payments.StoreConfig{
+			"store-a": {Alias: "store-a", ID: "store-id-a"},
+		},
+	}, payments.NewMemoryRepository(), &fakePayPhone{})
+	handler := httpapi.New(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/payments", strings.NewReader(`{"order_id":"order","amount":100,"amount":101,"currency":"USD"}`))
+	request.Header.Set("Authorization", "Bearer project-a-secret")
+	request.Header.Set("Idempotency-Key", "duplicate-json")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("duplicate JSON status = %d, want 400; body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCreateRejectsCaseVariantJSONKeys(t *testing.T) {
+	service := payments.NewService(payments.Config{
+		PublicBaseURL: "https://proxy.example.test",
+		Projects: map[string]payments.Project{
+			"project-a": {ID: "project-a", APIKey: "project-a-secret", StoreAlias: "store-a"},
+		},
+		Stores: map[string]payments.StoreConfig{
+			"store-a": {Alias: "store-a", ID: "store-id-a"},
+		},
+	}, payments.NewMemoryRepository(), &fakePayPhone{})
+	handler := httpapi.New(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/payments", strings.NewReader(`{"order_id":"order","Amount":100,"amount":101,"currency":"USD"}`))
+	request.Header.Set("Authorization", "Bearer project-a-secret")
+	request.Header.Set("Idempotency-Key", "case-variant-json")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("case-variant JSON status = %d, want 400; body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestReturnAttemptsAreRateLimitedPerTransaction(t *testing.T) {
+	provider := &fakePayPhone{confirmErr: errors.New("temporary provider failure")}
+	repository := payments.NewMemoryRepository()
+	service := payments.NewService(payments.Config{
+		PublicBaseURL: "https://proxy.example.test",
+		Projects: map[string]payments.Project{
+			"project-a": {ID: "project-a", APIKey: "project-a-secret", StoreAlias: "store-a"},
+		},
+		Stores: map[string]payments.StoreConfig{
+			"store-a": {Alias: "store-a", ID: "store-id-a"},
+		},
+	}, repository, provider)
+	handler := httpapi.New(service)
+	created := createPayment(t, handler, "project-a-secret", "rate-limit", `{"order_id":"rate-limit","amount":100,"currency":"USD"}`)
+	var payload struct {
+		ID string `json:"id"`
+	}
+	decodeJSON(t, created.Body, &payload)
+	payment, err := repository.ByID(context.Background(), payload.ID)
+	if err != nil {
+		t.Fatalf("load payment: %v", err)
+	}
+	for attempt := 1; attempt <= 7; attempt++ {
+		request := httptest.NewRequest(http.MethodGet, "/payphone/return?id=41&clientTransactionId="+payment.ClientTransactionID, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		want := http.StatusBadGateway
+		if attempt == 7 {
+			want = http.StatusTooManyRequests
+		}
+		if response.Code != want {
+			t.Fatalf("attempt %d status = %d, want %d; body=%s", attempt, response.Code, want, response.Body.String())
+		}
+		if attempt == 7 && response.Header().Get("Retry-After") != "60" {
+			t.Fatalf("Retry-After = %q", response.Header().Get("Retry-After"))
+		}
+	}
+	if got := len(provider.confirmCalls); got != 6 {
+		t.Fatalf("Confirm calls = %d, want 6", got)
 	}
 }
 

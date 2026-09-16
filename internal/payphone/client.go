@@ -127,7 +127,13 @@ func (c *HTTPClient) doJSON(ctx context.Context, method, path string, payload an
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
 
-	response, err := c.HTTPClient.Do(request)
+	// Treat redirects as terminal responses; the configured endpoint is
+	// authoritative.
+	httpClient := *c.HTTPClient
+	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	response, err := httpClient.Do(request)
 	if err != nil {
 		return fmt.Errorf("call PayPhone: %w", err)
 	}

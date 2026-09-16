@@ -60,3 +60,52 @@ func TestSQLiteRepositoryPersistsPaymentAndIdempotencyIndex(t *testing.T) {
 		t.Fatalf("duplicate reserve = %#v, created=%v, err=%v", duplicate, created, err)
 	}
 }
+
+func TestSQLiteRepositoryConditionalUpdatePreventsStaleTransition(t *testing.T) {
+	database, err := sql.Open("sqlite", "file:conditional-update-test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+	repository, err := payments.NewSQLiteRepository(database)
+	if err != nil {
+		t.Fatalf("create repository: %v", err)
+	}
+	payment := payments.Payment{
+		ID:                  "pay_conditional",
+		ProjectID:           "project-a",
+		OrderID:             "order-conditional",
+		Amount:              100,
+		Currency:            "USD",
+		StoreAlias:          "store-a",
+		StoreID:             "store-id-a",
+		IdempotencyKey:      "request-conditional",
+		ClientTransactionID: "client-conditional",
+		PublicToken:         "public-conditional",
+		CheckoutURL:         "https://proxy.example.test/checkout/public-conditional",
+		Status:              payments.StatusPreparing,
+		CreatedAt:           time.Now().UTC(),
+		UpdatedAt:           time.Now().UTC(),
+	}
+	if _, created, err := repository.Reserve(context.Background(), payment); err != nil || !created {
+		t.Fatalf("reserve created=%v err=%v", created, err)
+	}
+	pending := payment
+	pending.Status = payments.StatusPending
+	pending.UpdatedAt = time.Now().UTC()
+	updated, err := repository.UpdateIfStatus(context.Background(), pending, payments.StatusPreparing)
+	if err != nil || !updated {
+		t.Fatalf("first conditional update = %v, err=%v", updated, err)
+	}
+	stale := pending
+	stale.Status = payments.StatusCancelled
+	stale.UpdatedAt = time.Now().UTC()
+	updated, err = repository.UpdateIfStatus(context.Background(), stale, payments.StatusPreparing)
+	if err != nil || updated {
+		t.Fatalf("stale conditional update = %v, err=%v; want false", updated, err)
+	}
+	current, err := repository.ByID(context.Background(), payment.ID)
+	if err != nil || current.Status != payments.StatusPending {
+		t.Fatalf("current status = %q, err=%v; want pending", current.Status, err)
+	}
+}
